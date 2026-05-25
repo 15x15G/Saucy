@@ -1,5 +1,4 @@
 using Dalamud.Game.ClientState.Conditions;
-using Dalamud.Game.Command;
 using Dalamud.Plugin;
 using ECommons;
 using ECommons.Configuration;
@@ -11,86 +10,87 @@ using NAudio.Wave;
 using PunishLib;
 using Saucy.CuffACur;
 using Saucy.Framework;
-using Saucy.OtherGames;
 using Saucy.OutOnALimb;
 using Saucy.TripleTriad;
 using System;
-using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.IO;
 using System.Linq;
-using System.Threading;
 using System.Threading.Tasks;
 using TriadBuddyPlugin;
 using static ECommons.GenericHelpers;
+using Module = ECommons.Module;
 
 namespace Saucy;
 
 public sealed class Saucy : IDalamudPlugin
 {
-    public string Name => "Saucy";
-    public static Configuration C { get; private set; } = null!;
-    public static Saucy P;
-
     private const string commandName = "/saucy";
+    public static Saucy P = null!;
 
     public static Solver TTSolver = new();
 
-    public static UIReaderTriadGame uiReaderGame;
-    public static UIReaderTriadPrep uiReaderPrep;
-    public static UIReaderTriadCardList uiReaderCardList;
-    public static UIReaderTriadDeckEdit uiReaderDeckEdit;
-    public static UIReaderScheduler uiReaderScheduler;
-    public static UIReaderGamesResults uiReaderGamesResults;
-    public static StatTracker statTracker;
-    public static GameDataLoader dataLoader;
-    public static List<Task> AirForceOneTask = [];
-    public static CancellationTokenSource AirForceOneToken = new();
+    public static UIReaderTriadGame uiReaderGame = null!;
+    public static UIReaderTriadPrep uiReaderPrep = null!;
+    public static UIReaderTriadCardList uiReaderCardList = null!;
+    public static UIReaderTriadDeckEdit uiReaderDeckEdit = null!;
+    public static UIReaderScheduler uiReaderScheduler = null!;
+    public static UIReaderGamesResults uiReaderGamesResults = null!;
+    public static StatTracker statTracker = null!;
+    public static GameDataLoader dataLoader = null!;
+    internal static bool openTT;
+    public static ModuleManager ModuleManager = null!;
 
-    public static bool GameFinished => TTSolver.cachedScreenState == null;
-    internal static bool openTT = false;
+    private readonly object _lockObj = new();
+    private Mp3FileReader? _currentReader;
+    private WaveOutEvent? _currentWaveOut;
 
-    public LimbManager LimbManager;
-    public static ModuleManager ModuleManager;
+    public LimbManager LimbManager = null!;
     public Saucy(IDalamudPluginInterface pluginInterface)
     {
-        ECommonsMain.Init(pluginInterface, this, ECommons.Module.All);
-        PunishLibMain.Init(pluginInterface, "Saucy", new AboutPlugin() { Sponsor = "https://ko-fi.com/taurenkey" });
+        ECommonsMain.Init(pluginInterface, this, Module.All);
+        PunishLibMain.Init(pluginInterface, "Saucy", new AboutPlugin
+        {
+            Sponsor = "https://ko-fi.com/taurenkey"
+        });
         EzConfig.Migrate<Configuration>();
         C = EzConfig.Init<Configuration>();
         P = this;
 
         EzConfigGui.Init(new PluginUI());
+        Svc.PluginInterface.UiBuilder.OpenMainUi += EzConfigGui.Open;
 
-        Svc.Commands.AddHandler(commandName, new CommandInfo(OnCommand)
+        Svc.Commands.AddHandler(commandName, new(OnCommand)
         {
             HelpMessage = "Opens the Saucy menu."
         });
 
-        dataLoader = new GameDataLoader();
+        dataLoader = new();
         dataLoader.StartAsyncWork();
 
-        TTSolver.profileGS = new UnsafeReaderProfileGS();
+        TTSolver.profileGS = new();
 
-        uiReaderGame = new UIReaderTriadGame();
+        uiReaderGame = new();
+#pragma warning disable CS8622 // Nullability mismatch in vendored delegate
         uiReaderGame.OnUIStateChanged += TTSolver.UpdateGame;
+#pragma warning restore CS8622
 
-        uiReaderPrep = new UIReaderTriadPrep
+        uiReaderPrep = new()
         {
             shouldScanDeckData = (TTSolver.profileGS == null) || TTSolver.profileGS.HasErrors
         };
         uiReaderPrep.OnUIStateChanged += TTSolver.UpdateDecks;
 
-        uiReaderCardList = new UIReaderTriadCardList();
+        uiReaderCardList = new();
 
         var uiReaderMatchResults = new UIReaderTriadResults();
         uiReaderMatchResults.OnUpdated += CheckResults;
 
-        uiReaderGamesResults = new UIReaderGamesResults(Svc.GameGui);
+        uiReaderGamesResults = new(Svc.GameGui);
         uiReaderGamesResults.OnCuffUpdated += CheckCuffResults;
         uiReaderGamesResults.OnLimbUpdated += CheckLimbResults;
 
-        uiReaderScheduler = new UIReaderScheduler(Svc.GameGui);
+        uiReaderScheduler = new(Svc.GameGui);
         uiReaderScheduler.AddObservedAddon(uiReaderGame);
         uiReaderScheduler.AddObservedAddon(uiReaderPrep.uiReaderMatchRequest);
         uiReaderScheduler.AddObservedAddon(uiReaderPrep.uiReaderDeckSelect);
@@ -107,16 +107,37 @@ public sealed class Saucy : IDalamudPlugin
         ModuleManager = new();
         C.EnabledModules.CollectionChanged += OnChange;
     }
+    public string Name => "Saucy";
+    public static Configuration C { get; private set; } = null!;
 
-    private void OnChange(object sender, NotifyCollectionChangedEventArgs e)
+    public static bool GameFinished => TTSolver.cachedScreenState == null;
+
+    public void Dispose()
+    {
+        Svc.Commands.RemoveHandler(commandName);
+        Svc.PluginInterface.UiBuilder.OpenMainUi -= EzConfigGui.Open;
+        Svc.Framework.Update -= RunBot;
+        lock (_lockObj) { DisposeAudio(); }
+        CufModule.FuncHook?.Dispose();
+        LimbManager.Dispose();
+        ModuleManager.Dispose();
+        ECommonsMain.Dispose(); //Don't forget!
+        P = null!; //necessary to free the reference for GC
+    }
+
+    private void OnChange(object? sender, NotifyCollectionChangedEventArgs e)
     {
         foreach (var m in ModuleManager.Modules)
         {
             if (C.EnabledModules.Contains(m.InternalName) && !m.IsEnabled)
+            {
                 m.EnableInternal();
+            }
 
             if (!C.EnabledModules.Contains(m.InternalName) && m.IsEnabled)
+            {
                 m.DisableInternal();
+            }
         }
     }
 
@@ -137,39 +158,56 @@ public sealed class Saucy : IDalamudPlugin
 
     private async void CheckCuffResults(UIStateCuffResults obj)
     {
-        if (CufModule.ModuleEnabled)
+        try
         {
-            C.UpdateStats(stats =>
+            if (CufModule.ModuleEnabled)
             {
-                stats.CuffMGP += GetBonusMGP(obj.numMGP);
-                if (obj.isPunishing) stats.CuffPunishings += 1;
-                if (obj.isBrutal) stats.CuffBrutals += 1;
-                if (obj.isBruising) stats.CuffBruisings += 1;
-
-                stats.CuffGamesPlayed += 1;
-            });
-
-            if (TriadAutomater.PlayXTimes)
-                TriadAutomater.NumberOfTimes--;
-
-            if (TriadAutomater.NumberOfTimes == 0 && TriadAutomater.PlayXTimes)
-            {
-                TriadAutomater.NumberOfTimes = 1;
-                CufModule.ModuleEnabled = false;
-                if (C.PlaySound)
+                C.UpdateStats(stats =>
                 {
-                    PlaySound();
+                    stats.CuffMGP += GetBonusMGP(obj.numMGP);
+                    if (obj.isPunishing)
+                    {
+                        stats.CuffPunishings += 1;
+                    }
+                    if (obj.isBrutal)
+                    {
+                        stats.CuffBrutals += 1;
+                    }
+                    if (obj.isBruising)
+                    {
+                        stats.CuffBruisings += 1;
+                    }
+
+                    stats.CuffGamesPlayed += 1;
+                });
+
+                if (TriadAutomater.PlayXTimes)
+                {
+                    TriadAutomater.NumberOfTimes--;
                 }
 
-                if (TriadAutomater.LogOutAfterCompletion)
+                if (TriadAutomater.NumberOfTimes == 0 && TriadAutomater.PlayXTimes)
                 {
-                    await Svc.Framework.RunOnTick(TriadAutomater.Logout, TimeSpan.FromMilliseconds(2000));
-                    await Svc.Framework.RunOnTick(TriadAutomater.SelectYesLogout, TimeSpan.FromMilliseconds(3500));
+                    TriadAutomater.NumberOfTimes = 1;
+                    CufModule.ModuleEnabled = false;
+                    if (C.PlaySound)
+                    {
+                        PlaySound();
+                    }
+
+                    if (TriadAutomater.LogOutAfterCompletion)
+                    {
+                        await PerformLogout();
+                    }
                 }
+
+                uiReaderGamesResults.SetIsResultsUI(false);
+                C.Save();
             }
-
-            uiReaderGamesResults.SetIsResultsUI(false);
-            C.Save();
+        }
+        catch (Exception ex)
+        {
+            Svc.Log.Error(ex, "cuff results handling failed");
         }
     }
 
@@ -182,19 +220,30 @@ public sealed class Saucy : IDalamudPlugin
                 stats.GamesPlayedWithSaucy++;
                 stats.MGPWon += GetBonusMGP(obj.numMGP);
 
-                if (stats.NPCsPlayed.TryGetValue(TTSolver.lastGameNpc.Name.GetLocalized(), out var plays))
-                    stats.NPCsPlayed[TTSolver.lastGameNpc.Name.GetLocalized()] += 1;
+                var npcName = TTSolver.lastGameNpc.Name.GetLocalized();
+                if (stats.NPCsPlayed.TryGetValue(npcName, out var plays))
+                {
+                    stats.NPCsPlayed[npcName] += 1;
+                }
                 else
-                    stats.NPCsPlayed.TryAdd(TTSolver.lastGameNpc.Name.GetLocalized(), 1);
+                {
+                    stats.NPCsPlayed.TryAdd(npcName, 1);
+                }
 
                 if (obj.isLose)
+                {
                     stats.GamesLostWithSaucy++;
+                }
                 if (obj.isDraw)
+                {
                     stats.GamesDrawnWithSaucy++;
+                }
             });
 
             if (TriadAutomater.PlayXTimes)
+            {
                 TriadAutomater.NumberOfTimes--;
+            }
 
             if (obj.isWin)
             {
@@ -202,7 +251,9 @@ public sealed class Saucy : IDalamudPlugin
                 if (obj.cardItemId > 0)
                 {
                     if (TriadAutomater.PlayUntilCardDrops)
+                    {
                         TriadAutomater.NumberOfTimes--;
+                    }
 
                     C.UpdateStats(stats => stats.CardsDroppedWithSaucy++);
 
@@ -215,35 +266,47 @@ public sealed class Saucy : IDalamudPlugin
                             C.UpdateStats(stats =>
                             {
                                 if (stats.CardsWon.ContainsKey((uint)cardInfo.CardId))
+                                {
                                     stats.CardsWon[(uint)cardInfo.CardId] += 1;
+                                }
                                 else
+                                {
                                     stats.CardsWon[(uint)cardInfo.CardId] = 1;
+                                }
                             });
 
                             if (TriadAutomater.TempCardsWonList.ContainsKey((uint)cardInfo.CardId))
+                            {
                                 TriadAutomater.TempCardsWonList[(uint)cardInfo.CardId] += 1;
+                            }
                         }
                     }
                 }
             }
 
             Rematch();
+            C.Save();
         }
-        C.Save();
-
     }
 
     private int GetBonusMGP(int numMGP)
     {
         double multiplier = 1;
-        //Jackpot
-        if (Svc.Objects.LocalPlayer.StatusList.Any(x => x.StatusId == 902))
+        var localPlayer = Svc.Objects.LocalPlayer;
+        if (localPlayer == null)
         {
-            multiplier += (double)Svc.Objects.LocalPlayer.StatusList.First(x => x.StatusId == 902).Param / 100;
+            return numMGP;
+        }
+
+        //Jackpot
+        var jackpot = localPlayer.StatusList.FirstOrDefault(x => x.StatusId == 902);
+        if (jackpot != null)
+        {
+            multiplier += (double)jackpot.Param / 100;
         }
 
         //MGP Card
-        if (Svc.Objects.LocalPlayer.StatusList.Any(x => x.StatusId == 1079))
+        if (localPlayer.StatusList.Any(x => x.StatusId == 1079))
         {
             multiplier += 0.15;
         }
@@ -267,13 +330,11 @@ public sealed class Saucy : IDalamudPlugin
                 var values = stackalloc AtkValue[2];
                 values[0] = new()
                 {
-                    Type = AtkValueType.Int,
-                    Int = 0,
+                    Type = AtkValueType.Int, Int = 0
                 };
                 values[1] = new()
                 {
-                    Type = AtkValueType.UInt,
-                    UInt = 1,
+                    Type = AtkValueType.UInt, UInt = 1
                 };
                 addon->FireCallback(2, values);
             }
@@ -290,71 +351,65 @@ public sealed class Saucy : IDalamudPlugin
                 var deltaSeconds = (float)framework.UpdateDelta.TotalSeconds;
                 uiReaderScheduler.Update(deltaSeconds);
             }
-        }
-        catch (Exception ex)
-        {
-            Svc.Log.Error(ex, "state update failed");
-        }
 
-        if (C.OpenAutomatically && uiReaderPrep.HasMatchRequestUI && !TriadAutomater.ModuleEnabled)
-        {
-            EzConfigGui.Open();
-            openTT = true;
-        }
-
-        if (CufModule.ModuleEnabled)
-        {
-            CufModule.RunModule();
-            return;
-        }
-
-        if (TriadAutomater.ModuleEnabled)
-        {
-            if (((TriadAutomater.PlayXTimes || TriadAutomater.PlayUntilCardDrops) && TriadAutomater.NumberOfTimes == 0) || (TriadAutomater.TempCardsWonList.Count > 0 && TriadAutomater.TempCardsWonList.All(x => x.Value >= TriadAutomater.NumberOfTimes)))
+            if (C.OpenAutomatically && uiReaderPrep.HasMatchRequestUI && !TriadAutomater.ModuleEnabled)
             {
-                if (Svc.Condition[ConditionFlag.OccupiedInQuestEvent] ||
-                    Svc.Condition[ConditionFlag.Occupied33] ||
-                    Svc.Condition[ConditionFlag.OccupiedInEvent] ||
-                    Svc.Condition[ConditionFlag.Occupied30] ||
-                    Svc.Condition[ConditionFlag.Occupied38] ||
-                    Svc.Condition[ConditionFlag.Occupied39] ||
-                    Svc.Condition[ConditionFlag.OccupiedSummoningBell] ||
-                    Svc.Condition[ConditionFlag.WatchingCutscene] ||
-                    Svc.Condition[ConditionFlag.Mounting71] ||
-                    Svc.Condition[ConditionFlag.CarryingObject])
-                {
-                    SkipDialogue();
-                }
-                else
-                {
-                    if (C.PlaySound)
-                    {
-                        PlaySound();
-                    }
+                EzConfigGui.Open();
+                openTT = true;
+            }
 
-                    TriadAutomater.PlayXTimes = false;
-                    TriadAutomater.PlayUntilCardDrops = false;
-                    TriadAutomater.PlayUntilAllCardsDropOnce = false;
-                    TriadAutomater.ModuleEnabled = false;
-                    TriadAutomater.TempCardsWonList.Clear();
-                    TriadAutomater.NumberOfTimes = 1;
-
-                    if (TriadAutomater.LogOutAfterCompletion)
-                    {
-                        await Svc.Framework.RunOnTick(TriadAutomater.Logout, TimeSpan.FromMilliseconds(2000));
-                        await Svc.Framework.RunOnTick(TriadAutomater.SelectYesLogout, TimeSpan.FromMilliseconds(3500));
-                    }
-                }
-
+            if (CufModule.ModuleEnabled)
+            {
+                CufModule.RunModule();
                 return;
             }
 
-            TriadAutomater.RunModule();
-            return;
-        }
-        else
-        {
+            if (TriadAutomater.ModuleEnabled)
+            {
+                if (((TriadAutomater.PlayXTimes || TriadAutomater.PlayUntilCardDrops) && TriadAutomater.NumberOfTimes == 0) || (TriadAutomater.TempCardsWonList.Count > 0 && TriadAutomater.TempCardsWonList.All(x => x.Value >= TriadAutomater.NumberOfTimes)))
+                {
+                    if (Svc.Condition[ConditionFlag.OccupiedInQuestEvent] ||
+                        Svc.Condition[ConditionFlag.Occupied33] ||
+                        Svc.Condition[ConditionFlag.OccupiedInEvent] ||
+                        Svc.Condition[ConditionFlag.Occupied30] ||
+                        Svc.Condition[ConditionFlag.Occupied38] ||
+                        Svc.Condition[ConditionFlag.Occupied39] ||
+                        Svc.Condition[ConditionFlag.OccupiedSummoningBell] ||
+                        Svc.Condition[ConditionFlag.WatchingCutscene] ||
+                        Svc.Condition[ConditionFlag.Mounting71] ||
+                        Svc.Condition[ConditionFlag.CarryingObject])
+                    {
+                        SkipDialogue();
+                    }
+                    else
+                    {
+                        if (C.PlaySound)
+                        {
+                            PlaySound();
+                        }
 
+                        TriadAutomater.PlayXTimes = false;
+                        TriadAutomater.PlayUntilCardDrops = false;
+                        TriadAutomater.PlayUntilAllCardsDropOnce = false;
+                        TriadAutomater.ModuleEnabled = false;
+                        TriadAutomater.TempCardsWonList.Clear();
+                        TriadAutomater.NumberOfTimes = 1;
+
+                        if (TriadAutomater.LogOutAfterCompletion)
+                        {
+                            await PerformLogout();
+                        }
+                    }
+
+                    return;
+                }
+
+                TriadAutomater.RunModule();
+            }
+        }
+        catch (Exception ex)
+        {
+            Svc.Log.Error(ex, "bot update failed");
         }
     }
 
@@ -362,105 +417,132 @@ public sealed class Saucy : IDalamudPlugin
     {
         try
         {
-            var talk = Svc.GameGui.GetAddonByName("Talk", 1);
-            if (talk == IntPtr.Zero) return;
+            var talk = Svc.GameGui.GetAddonByName("Talk");
+            if (talk == nint.Zero)
+            {
+                return;
+            }
             var talkAddon = (AtkUnitBase*)talk.Address;
-            if (!IsAddonReady(talkAddon)) return;
+            if (!IsAddonReady(talkAddon))
+            {
+                return;
+            }
             new AddonMaster.Talk(talk).Click();
         }
         catch { }
     }
 
-    private readonly object _lockObj = new();
+    private static async Task PerformLogout()
+    {
+        await Svc.Framework.RunOnTick(TriadAutomater.Logout, TimeSpan.FromMilliseconds(2000));
+        await Svc.Framework.RunOnTick(TriadAutomater.SelectYesLogout, TimeSpan.FromMilliseconds(3500));
+    }
 
     private void PlaySound()
     {
         lock (_lockObj)
         {
-            var sound = C.SelectedSound;
-            var path = Path.Combine(Svc.PluginInterface.AssemblyLocation.Directory.FullName, "Sounds", $"{sound}.mp3");
-            if (!File.Exists(path)) return;
-            var reader = new Mp3FileReader(path);
-            var waveOut = new WaveOutEvent();
+            DisposeAudio();
 
-            waveOut.Init(reader);
-            waveOut.Play();
+            var sound = C.SelectedSound;
+            var path = Path.Combine(Svc.PluginInterface.AssemblyLocation.Directory!.FullName, "Sounds", $"{sound}.mp3");
+            if (!File.Exists(path))
+            {
+                return;
+            }
+
+            _currentReader = new(path);
+            _currentWaveOut = new();
+            _currentWaveOut.PlaybackStopped += OnPlaybackStopped;
+            _currentWaveOut.Init(_currentReader);
+            _currentWaveOut.Play();
         }
     }
 
-    public void Dispose()
+    private void OnPlaybackStopped(object? sender, StoppedEventArgs e)
     {
-        Svc.Commands.RemoveHandler(commandName);
-        Svc.Framework.Update -= RunBot;
-        LimbManager.Dispose();
-        ModuleManager.Dispose();
-        ECommonsMain.Dispose(); //Don't forget!
-        P = null; //necessary to free the reference for GC
+        lock (_lockObj)
+        {
+            DisposeAudio();
+        }
+    }
+
+    private void DisposeAudio()
+    {
+        if (_currentWaveOut != null)
+        {
+            _currentWaveOut.PlaybackStopped -= OnPlaybackStopped;
+            _currentWaveOut.Dispose();
+            _currentWaveOut = null;
+        }
+        if (_currentReader != null)
+        {
+            _currentReader.Dispose();
+            _currentReader = null;
+        }
     }
 
     private void OnCommand(string command, string arguments)
     {
         if (arguments.Length == 0)
+        {
             EzConfigGui.Toggle();
+            return;
+        }
 
         var args = arguments.Split();
-        if (args.Length > 0)
+        if (args.Length < 2 || args[0].ToLower() != "tt")
         {
-            if (args[0].ToLower() == "tt")
+            return;
+        }
+
+        var subCommand = args[1].ToLower();
+
+        if (subCommand == "go")
+        {
+            TriadAutomater.ModuleEnabled = true;
+            Svc.Chat.Print("[Saucy] Triad Module Enabled!");
+            return;
+        }
+
+        if (subCommand == "stop")
+        {
+            TriadAutomater.ModuleEnabled = false;
+            Svc.Chat.Print("[Saucy] Triad Module Disabled!");
+            return;
+        }
+
+        if (subCommand == "play" && args.Length >= 3)
+        {
+            if (int.TryParse(args[2], out var val))
             {
-                if (args[1].ToLower() == "go")
-                {
-                    TriadAutomater.ModuleEnabled = true;
-                    Svc.Chat.Print("[Saucy] Triad Module Enabled!");
-                    return;
-                }
+                TriadAutomater.PlayXTimes = true;
+                Svc.Chat.Print("[Saucy] Play X Amount of Times Enabled!");
+                TriadAutomater.NumberOfTimes = val;
+            }
+            else
+            {
+                Svc.Chat.Print($"[Saucy] Incorrect value specified: {args[2]}");
+            }
+            return;
+        }
 
-                if (args[1].ToLower() == "play")
-                {
+        if (subCommand == "cards" && args.Length >= 3)
+        {
+            if (args[2].ToLower() == "any")
+            {
+                TriadAutomater.PlayUntilCardDrops = true;
+                Svc.Chat.Print("[Saucy] Play Until Any Cards Drop Enabled!");
+            }
+            if (args[2].ToLower() == "all")
+            {
+                TriadAutomater.PlayUntilAllCardsDropOnce = true;
+                Svc.Chat.Print("[Saucy] Play Until All Cards Drop from NPC at Least X Times Enabled!");
+            }
 
-                    if (int.TryParse(args[2], out var val))
-                    {
-                        TriadAutomater.PlayXTimes = true;
-                        Svc.Chat.Print("[Saucy] Play X Amount of Times Enabled!");
-                        TriadAutomater.NumberOfTimes = val;
-                    }
-                    else
-                    {
-                        Svc.Chat.Print($"[Saucy] Incorrect value specified: {args[2]}");
-                    }
-                    return;
-                }
-
-                if (args[1].ToLower() == "stop")
-                {
-                    TriadAutomater.ModuleEnabled = false;
-                    Svc.Chat.Print("[Saucy] Triad Module Disabled!");
-                    return;
-                }
-
-                if (args[1].ToLower() == "cards")
-                {
-                    if (args[2].ToLower() == "any")
-                    {
-                        TriadAutomater.PlayUntilCardDrops = true;
-                        Svc.Chat.Print("[Saucy] Play Until Any Cards Drop Enabled!");
-                    }
-                    if (args[2].ToLower() == "all")
-                    {
-                        TriadAutomater.PlayUntilAllCardsDropOnce = true;
-                        Svc.Chat.Print("[Saucy] Play Until All Cards Drop from NPC at Least X Times Enabled!");
-                    }
-
-                    if (int.TryParse(args[3], out var val))
-                    {
-                        TriadAutomater.NumberOfTimes = val;
-                        return;
-                    }
-                    else
-                    {
-                        return;
-                    }
-                }
+            if (args.Length >= 4 && int.TryParse(args[3], out var val))
+            {
+                TriadAutomater.NumberOfTimes = val;
             }
         }
     }

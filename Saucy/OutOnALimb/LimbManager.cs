@@ -1,11 +1,9 @@
-﻿using Dalamud.Bindings.ImGui;
+using Dalamud.Bindings.ImGui;
 using Dalamud.Game;
 using Dalamud.Game.Chat;
 using Dalamud.Game.ClientState.Conditions;
-using Dalamud.Game.ClientState.Objects.Enums;
 using Dalamud.Game.Text;
 using Dalamud.Interface.Colors;
-using Dalamud.Memory;
 using ECommons.Automation.UIInput;
 using ECommons.EzEventManager;
 using ECommons.GameHelpers;
@@ -14,6 +12,7 @@ using ECommons.Reflection;
 using ECommons.Throttlers;
 using ECommons.UIHelpers.AddonMasterImplementations;
 using FFXIVClientStructs.FFXIV.Client.Game.Control;
+using FFXIVClientStructs.FFXIV.Client.Game.Object;
 using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 using Lumina.Excel.Sheets;
@@ -23,25 +22,43 @@ using System.Linq;
 using System.Numerics;
 using System.Text.RegularExpressions;
 using static ECommons.GenericHelpers;
+using ObjectKind = Dalamud.Game.ClientState.Objects.Enums.ObjectKind;
 
 namespace Saucy.OutOnALimb;
 
 public unsafe class LimbManager : IDisposable
 {
-    private uint OldState = 0;
     private static readonly int[] StartingPoints = [20, 50, 80];
-    private int RequestInput = 0;
-    private int? Request = null;
-    private bool OnlyRequest = false;
-    private readonly List<HitResult> Results = [];
-    private int? Next = null;
-    private int MinIndex = 0;
-    private bool RecordMinIndex = false;
-    public int GamesToPlay = 0;
-    public LimbConfig Cfg;
-    private bool Exit = false;
 
-    private static bool TidyChat => DalamudReflector.TryGetDalamudPlugin("TidyChat", out var _, false, true);
+    private static readonly Dictionary<LimbDifficulty, int> Heights = new()
+    {
+        [LimbDifficulty.Titan] = 20, [LimbDifficulty.Morbol] = 40, [LimbDifficulty.Cactuar] = 340
+    };
+    private static readonly Dictionary<LimbDifficulty, uint> NodeIDs = new()
+    {
+        [LimbDifficulty.Titan] = 41, [LimbDifficulty.Morbol] = 44, [LimbDifficulty.Cactuar] = 47
+    };
+
+    private readonly Dictionary<LimbDifficulty, int[]> FPSRequirements = new()
+    {
+        [LimbDifficulty.Titan] = [480, 240, 120, 90, 60], [LimbDifficulty.Morbol] = [240, 120, 90, 60, 30], [LimbDifficulty.Cactuar] = [120, 90, 60, 30, 15]
+    };
+
+    private readonly Dictionary<string, HitPower> HitPowerText = new()
+    {
+        [Svc.Data.GetExcelSheet<Addon>().GetRow(9710).Text.GetText().RemoveSpaces()] = HitPower.Nothing, [Svc.Data.GetExcelSheet<Addon>().GetRow(9711).Text.GetText().RemoveSpaces()] = HitPower.Weak, [Svc.Data.GetExcelSheet<Addon>().GetRow(9712).Text.GetText().RemoveSpaces()] = HitPower.Strong, [Svc.Data.GetExcelSheet<Addon>().GetRow(9713).Text.GetText().RemoveSpaces()] = HitPower.Maximum
+    };
+    private readonly List<HitResult> Results = [];
+    public LimbConfig Cfg;
+    private bool Exit;
+    public int GamesToPlay;
+    private int MinIndex;
+    private int? Next;
+    private uint OldState;
+    private bool OnlyRequest;
+    private bool RecordMinIndex;
+    private int? Request;
+    private int RequestInput;
 
     public LimbManager(LimbConfig conf)
     {
@@ -50,10 +67,9 @@ public unsafe class LimbManager : IDisposable
         Svc.Chat.ChatMessage += Chat_ChatMessage;
     }
 
-    public void Dispose()
-    {
-        Svc.Chat.ChatMessage -= Chat_ChatMessage;
-    }
+    private static bool TidyChat => DalamudReflector.TryGetDalamudPlugin("TidyChat", out var _, false, true);
+
+    public void Dispose() => Svc.Chat.ChatMessage -= Chat_ChatMessage;
 
     private void InteractWithClosestLimb()
     {
@@ -69,21 +85,27 @@ public unsafe class LimbManager : IDisposable
         {
             EzThrottler.Throttle("InteractPause", 1000, true);
         }
-        if (!EzThrottler.Check("InteractPause")) return;
+        if (!EzThrottler.Check("InteractPause"))
+        {
+            return;
+        }
+
+        //2005423	Out on a Limb	0	Out on a Limb machines	0	1	1	0	0
+        var machineNameGS = Svc.Data.GetExcelSheet<EObjName>().GetRow(2005423).Singular.GetText().RemoveSpaces();
+        //30425	Out on a Limb machine	0	Out on a Limb machines	0	1	1	0	0	Experience the heart-exploding excitement of the Gold Saucer in your own home with this authentic Out on a Limb machine.	Out on a Limb Machine	ui/icon/052000/052680.tex	1	1	14	Out on a Limb Machine	Furnishing		EquipSlotCategory#0	125	18740	1	False	True	False	False	2	0	False	False	False	ItemAction#0	2	0	adventurer	ItemRepairResource#0		0	False	False	0	1	0	0		None		0	0, 0, 0, 0	0, 0, 0, 0	adventurer	0	0	0	0	0	0	0	0	0		0		0		0		0		0		0		0		0		0		0		0		0		0	0	0	False	False	0	False
+        var machineNameHousing = Svc.Data.GetExcelSheet<Item>().GetRow(30425).Singular.GetText().RemoveSpaces();
+
         var found = false;
         foreach (var x in Svc.Objects)
         {
-            //2005423	Out on a Limb	0	Out on a Limb machines	0	1	1	0	0
-            //30425	Out on a Limb machine	0	Out on a Limb machines	0	1	1	0	0	Experience the heart-exploding excitement of the Gold Saucer in your own home with this authentic Out on a Limb machine.	Out on a Limb Machine	ui/icon/052000/052680.tex	1	1	14	Out on a Limb Machine	Furnishing		EquipSlotCategory#0	125	18740	1	False	True	False	False	2	0	False	False	False	ItemAction#0	2	0	adventurer	ItemRepairResource#0		0	False	False	0	1	0	0		None		0	0, 0, 0, 0	0, 0, 0, 0	adventurer	0	0	0	0	0	0	0	0	0		0		0		0		0		0		0		0		0		0		0		0		0		0	0	0	False	False	0	False
-
-            if (x.Name.GetText().EqualsIgnoreCaseAny(Svc.Data.GetExcelSheet<EObjName>().GetRow(2005423).Singular.GetText(), Svc.Data.GetExcelSheet<Item>().GetRow(30425).Singular.GetText()) && x.ObjectKind.EqualsAny(ObjectKind.EventObj, ObjectKind.HousingEventObject) && Vector3.Distance(Player.Object.Position, x.Position) < 4)
+            if (x.ObjectKind.EqualsAny(ObjectKind.EventObj, ObjectKind.HousingEventObject) && x.Name.GetText()!.RemoveSpaces().EqualsIgnoreCaseAny(machineNameGS, machineNameHousing) && Vector3.Distance(Player.Object!.Position, x.Position) < 4)
             {
                 found = true;
                 if (EzThrottler.Throttle("TargetAndInteract"))
                 {
                     if (Svc.Targets.Target?.Address == x.Address)
                     {
-                        TargetSystem.Instance()->InteractWithObject((FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)x.Address, false);
+                        TargetSystem.Instance()->InteractWithObject((GameObject*)x.Address, false);
                         EzThrottler.Throttle("TargetAndInteract", 10000, true);
                         GamesToPlay--;
                     }
@@ -100,18 +122,16 @@ public unsafe class LimbManager : IDisposable
         }
     }
 
-    private readonly Dictionary<string, HitPower> HitPowerText = new()
-    {
-        [Svc.Data.GetExcelSheet<Addon>().GetRow(9710).Text.GetText().RemoveSpaces()] = HitPower.Nothing,
-        [Svc.Data.GetExcelSheet<Addon>().GetRow(9711).Text.GetText().RemoveSpaces()] = HitPower.Weak,
-        [Svc.Data.GetExcelSheet<Addon>().GetRow(9712).Text.GetText().RemoveSpaces()] = HitPower.Strong,
-        [Svc.Data.GetExcelSheet<Addon>().GetRow(9713).Text.GetText().RemoveSpaces()] = HitPower.Maximum,
-    };
-
     private void Chat_ChatMessage(IHandleableChatMessage message)
     {
-        if (!Cfg.EnableLimb) return;
-        if (!Svc.Condition[ConditionFlag.OccupiedInQuestEvent]) return;
+        if (!Cfg.EnableLimb)
+        {
+            return;
+        }
+        if (!Svc.Condition[ConditionFlag.OccupiedInQuestEvent])
+        {
+            return;
+        }
         var text = message.Message.TextValue.RemoveSpaces();
         PluginLog.Information($"{message.LogKind}/{text}");
         if (message.LogKind is XivChatType.SystemMessage && message.SourceKind is XivChatRelationKind.LocalPlayer) // old value was 2105
@@ -190,9 +210,18 @@ public unsafe class LimbManager : IDisposable
 
     private void Tick()
     {
-        if (!Cfg.EnableLimb) return;
-        if (!Player.Available) return;
-        if (!IsScreenReady()) return;
+        if (!Cfg.EnableLimb)
+        {
+            return;
+        }
+        if (!Player.Available)
+        {
+            return;
+        }
+        if (!IsScreenReady())
+        {
+            return;
+        }
         if (GamesToPlay > 0)
         {
             InteractWithClosestLimb();
@@ -237,19 +266,20 @@ public unsafe class LimbManager : IDisposable
                         {
                             if (reader.SwingsLeft == 10)
                             {
-                                PluginLog.Debug($"Out on a limb - GAME RESET");
+                                PluginLog.Debug("Out on a limb - GAME RESET");
                                 Reset();
                             }
-                            PluginLog.Debug($"Out on a limb - turn start event");
+                            PluginLog.Debug("Out on a limb - turn start event");
                             Next = GetNextTargetCursorPos();
                         }
                         if (OnlyRequest)
                         {
                             if (Request != null)
                             {
-                                if (Math.Abs(cursor - Request.Value) < Cfg.Tolerance)
+                                AtkStage.Instance()->GetNumberArrayData(NumberArrayType.GoldSaucerArcadeMachine)->IntArray[0] = Math.Clamp(Request.Value * 100 + Random.Shared.Next(200) - 100, 1, 9999);
+                                if (SafeClickButtonBotanist())
                                 {
-                                    if (SafeClickButtonBotanist()) Request = null;
+                                    Request = null;
                                 }
                             }
                         }
@@ -257,9 +287,10 @@ public unsafe class LimbManager : IDisposable
                         {
                             if (Next != null)
                             {
-                                if (Math.Abs(cursor - Next.Value) < Cfg.Tolerance)
+                                AtkStage.Instance()->GetNumberArrayData(NumberArrayType.GoldSaucerArcadeMachine)->IntArray[0] = Math.Clamp(Next.Value * 100 + Random.Shared.Next(200) - 100, 1, 9999);
+                                if (SafeClickButtonBotanist())
                                 {
-                                    if (SafeClickButtonBotanist()) Next = null;
+                                    Next = null;
                                 }
                             }
                         }
@@ -268,7 +299,7 @@ public unsafe class LimbManager : IDisposable
                     {
                         if (OldState == 3)
                         {
-                            PluginLog.Debug($"Out on a limb - turn finish event");
+                            PluginLog.Debug("Out on a limb - turn finish event");
                         }
                     }
                     OldState = reader.State;
@@ -296,14 +327,17 @@ public unsafe class LimbManager : IDisposable
                     ClientLanguage.German => @"Momentaner Gewinn: ([0-9]+)",
                     ClientLanguage.Japanese => @"MGP.([0-9]+)",
                     ClientLanguage.ChineseSimplified => @"金碟币：([0-9]+)",
-                    _ => throw new ArgumentOutOfRangeException(nameof(Svc.ClientState.ClientLanguage))
+                    var _ => throw new ArgumentOutOfRangeException(nameof(Svc.ClientState.ClientLanguage))
                 }).Match(text);
                 if (matches.Success)
                 {
                     var mgp = int.Parse(matches.Groups[1].Value);
                     if (Exit)
                     {
-                        if (EzThrottler.Throttle("Yesno", 2000)) new AddonMaster.SelectYesno(ss).No();
+                        if (EzThrottler.Throttle("Yesno", 2000))
+                        {
+                            new AddonMaster.SelectYesno(ss).No();
+                        }
                     }
                     else
                     {
@@ -311,22 +345,34 @@ public unsafe class LimbManager : IDisposable
                         {
                             if (reader.SecondsRemaining > Cfg.StopAt)
                             {
-                                if (EzThrottler.Throttle("Yesno", 2000)) new AddonMaster.SelectYesno(ss).Yes();
+                                if (EzThrottler.Throttle("Yesno", 2000))
+                                {
+                                    new AddonMaster.SelectYesno(ss).Yes();
+                                }
                             }
                             else
                             {
-                                if (EzThrottler.Throttle("Yesno", 2000)) new AddonMaster.SelectYesno(ss).No();
+                                if (EzThrottler.Throttle("Yesno", 2000))
+                                {
+                                    new AddonMaster.SelectYesno(ss).No();
+                                }
                             }
                         }
                         else
                         {
                             if (reader.SecondsRemaining > Cfg.HardStopAt)
                             {
-                                if (EzThrottler.Throttle("Yesno", 2000)) new AddonMaster.SelectYesno(ss).Yes();
+                                if (EzThrottler.Throttle("Yesno", 2000))
+                                {
+                                    new AddonMaster.SelectYesno(ss).Yes();
+                                }
                             }
                             else
                             {
-                                if (EzThrottler.Throttle("Yesno", 2000)) new AddonMaster.SelectYesno(ss).No();
+                                if (EzThrottler.Throttle("Yesno", 2000))
+                                {
+                                    new AddonMaster.SelectYesno(ss).No();
+                                }
                             }
                         }
                     }
@@ -341,7 +387,10 @@ public unsafe class LimbManager : IDisposable
         for (var i = 0; i < num; i++)
         {
             var r = Results.SafeSelect(index + i);
-            if (r != null) ret.Add(r);
+            if (r != null)
+            {
+                ret.Add(r);
+            }
         }
         return ret;
     }
@@ -352,7 +401,10 @@ public unsafe class LimbManager : IDisposable
         for (var i = 0; i < num; i++)
         {
             var r = Results.SafeSelect(index - i);
-            if (r != null) ret.Add(r);
+            if (r != null)
+            {
+                ret.Add(r);
+            }
         }
         return ret;
     }
@@ -377,18 +429,30 @@ public unsafe class LimbManager : IDisposable
             var next = Results.SafeSelect(i + 1);
             if (current.Power == HitPower.Weak)
             {
-                if (prev?.Power == HitPower.Unobserved && i - 1 >= MinIndex) return prev.Position;
-                if (next?.Power == HitPower.Unobserved) return next.Position;
+                if (prev?.Power == HitPower.Unobserved && i - 1 >= MinIndex)
+                {
+                    return prev.Position;
+                }
+                if (next?.Power == HitPower.Unobserved)
+                {
+                    return next.Position;
+                }
             }
         }
         foreach (var x in StartingPoints)
         {
             int[] adjustedPoints = [.. StartingPoints.Where(z => !IsStartingPointChecked(z))];
-            if (adjustedPoints.Length == 0) break;
+            if (adjustedPoints.Length == 0)
+            {
+                break;
+            }
             var transformedPoints = adjustedPoints.Select(z => GetClosestResultPoint(z).Position).ToArray();
-            var index = 0;// Random.Shared.Next(transformedPoints.Length);
+            var index = 0; // Random.Shared.Next(transformedPoints.Length);
             PluginLog.Debug($"Returning starting point {adjustedPoints[index]}->{transformedPoints[index]}");
-            if (StartingPoints.Length != transformedPoints.Length) RecordMinIndex = true;
+            if (StartingPoints.Length != transformedPoints.Length)
+            {
+                RecordMinIndex = true;
+            }
             return transformedPoints[index];
         }
         MinIndex = 0;
@@ -403,10 +467,7 @@ public unsafe class LimbManager : IDisposable
         return res;
     }
 
-    private HitResult GetClosestResultPoint(int point)
-    {
-        return Results.OrderBy(x => Math.Abs(point - x.Position)).First();
-    }
+    private HitResult GetClosestResultPoint(int point) => Results.OrderBy(x => Math.Abs(point - x.Position)).First();
 
     private bool IsStartingPointChecked(int position)
     {
@@ -436,67 +497,45 @@ public unsafe class LimbManager : IDisposable
         }
     }
 
-    private readonly Dictionary<LimbDifficulty, int[]> FPSRequirements = new()
-    {
-        [LimbDifficulty.Titan] = [480, 240, 120, 90, 60],
-        [LimbDifficulty.Morbol] = [240, 120, 90, 60, 30],
-        [LimbDifficulty.Cactuar] = [120, 90, 60, 30, 15],
-    };
-    private int CalcRequiredFPS()
-    {
-        return FPSRequirements.SafeSelect(Cfg.LimbDifficulty)?.SafeSelect(Cfg.Tolerance) ?? -1;
-    }
-
     public void DrawSettings()
     {
         var save = false;
-        ImGuiEx.TextWrapped($"How to use: enable module, walk up to the Out on a Limb machine in Gold Saucer, input number of games you want to play to play automatically or access the machine manually to play one game.");
+        ImGuiEx.TextWrapped("How to use: enable module, walk up to the Out on a Limb machine in Gold Saucer, input number of games you want to play to play automatically or access the machine manually to play one game.");
         if (TidyChat)
-            ImGuiEx.TextWrapped(ImGuiColors.DalamudRed, $@"Tidychat Warning: Please ensure you do not have ""You sense something..."" messages (Advanced -> System messages) hidden or this will not work");
+        {
+            ImGuiEx.TextWrapped(ImGuiColors.DalamudRed, @"Tidychat Warning: Please ensure you do not have ""You sense something..."" messages (Advanced -> System messages) hidden or this will not work");
+        }
         ImGui.Separator();
         save |= ImGui.Checkbox($"Enable", ref Cfg.EnableLimb);
         ImGui.SetNextItemWidth(100f);
         ImGui.InputInt("Games to play", ref GamesToPlay.ValidateRange(0, 9999));
         ImGui.SameLine();
-        if (ImGui.Button("Max")) GamesToPlay = 9999;
+        if (ImGui.Button("Max"))
+        {
+            GamesToPlay = 9999;
+        }
         ImGui.Checkbox($"Stop at next double down", ref Exit);
 
         ImGui.Separator();
         ImGui.SetNextItemWidth(100f);
         save |= ImGuiEx.EnumCombo("Difficulty", ref Cfg.LimbDifficulty);
         ImGui.SetNextItemWidth(100f);
-        save |= ImGuiEx.SliderInt($"Tolerance", ref Cfg.Tolerance.ValidateRange(1, 4), 1, 4);
-        ImGui.SameLine();
-        if (ImGui.Button("Default##1")) Cfg.Tolerance = new LimbConfig().Tolerance;
-        var req = CalcRequiredFPS();
-        var current = ImGui.GetIO().Framerate;
-        var delta = current - req;
-        ImGuiEx.TextWrapped(delta > -1 ? ImGuiColors.ParsedGreen : (delta > -(req * 0.15f) ? ImGuiColors.DalamudYellow : ImGuiColors.DalamudRed), $"Required framerate: {req}\nYour framerate: {(int)current}");
-        ImGuiEx.TextWrapped($"Reducing tolerance or difficulty will reduce required framerate.");
-        ImGui.SetNextItemWidth(100f);
         save |= ImGui.DragInt($"Step", ref Cfg.Step, 0.05f);
         ImGui.SameLine();
-        if (ImGui.Button("Default##2")) Cfg.Step = new LimbConfig().Step;
+        if (ImGui.Button("Default##2"))
+        {
+            Cfg.Step = new LimbConfig().Step;
+        }
         ImGui.SetNextItemWidth(100f);
         save |= ImGui.DragInt($"Stop at remaining time with big win", ref Cfg.StopAt, 0.5f);
         ImGui.SetNextItemWidth(100f);
         save |= ImGui.DragInt($"Stop at remaining time with little win", ref Cfg.HardStopAt, 0.5f);
 
-        if (save) C.Save();
+        if (save)
+        {
+            C.Save();
+        }
     }
-
-    private static readonly Dictionary<LimbDifficulty, int> Heights = new()
-    {
-        [LimbDifficulty.Titan] = 20,
-        [LimbDifficulty.Morbol] = 40,
-        [LimbDifficulty.Cactuar] = 340,
-    };
-    private static readonly Dictionary<LimbDifficulty, uint> NodeIDs = new()
-    {
-        [LimbDifficulty.Titan] = 41,
-        [LimbDifficulty.Morbol] = 44,
-        [LimbDifficulty.Cactuar] = 47,
-    };
     public void DrawDebug()
     {
         {
@@ -506,7 +545,10 @@ public unsafe class LimbManager : IDisposable
                 var reference = addon->GetNodeById(NodeIDs[Cfg.LimbDifficulty]);
                 var cursor = addon->GetNodeById(39);
                 var iCursor = 400 - cursor->Height;
-                if (iCursor > reference->Y && iCursor < reference->Y + Heights[Cfg.LimbDifficulty]) ImGuiEx.Text($"Yes");
+                if (iCursor > reference->Y && iCursor < reference->Y + Heights[Cfg.LimbDifficulty])
+                {
+                    ImGuiEx.Text("Yes");
+                }
                 ImGuiEx.Text($"Reference: {reference->Y}");
                 ImGuiEx.Text($"Cursor: {cursor->Height}");
             }
@@ -522,9 +564,15 @@ public unsafe class LimbManager : IDisposable
                 ImGui.SetNextItemWidth(100f);
                 ImGui.InputInt("Request input", ref RequestInput);
                 ImGui.SameLine();
-                if (ImGui.Button("Request")) Request = RequestInput;
+                if (ImGui.Button("Request"))
+                {
+                    Request = RequestInput;
+                }
                 ImGui.SameLine();
-                if (ImGui.Button("Reset")) Request = null;
+                if (ImGui.Button("Reset"))
+                {
+                    Request = null;
+                }
                 ImGuiEx.Text($"Button enabled: {button->IsEnabled}");
                 ImGuiEx.Text($"Seconds remaining: {reader.SecondsRemaining}");
                 if (ImGui.Button("Click"))
@@ -535,7 +583,7 @@ public unsafe class LimbManager : IDisposable
                     }
                 }
                 ImGuiEx.Text($"Next: {Next}, MinIndex: {MinIndex}, rec={RecordMinIndex}");
-                ImGuiEx.Text($"Starting points:\n{StartingPoints.Print(", ")}");
+                ImGuiEx.Text($"Starting points:\n{StartingPoints.Print()}");
                 ImGuiEx.Text($"Results:\n{Results.Select(x => $"{x.Position}={x.Power}").Print("\n")}");
             }
         }
